@@ -19,6 +19,7 @@ masks_data = []
 highlight_color = [0, 255, 0]  # Initial green color
 
 cam_device_index = 0
+
 cap = cv2.VideoCapture(cam_device_index)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
