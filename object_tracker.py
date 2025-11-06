@@ -1,4 +1,3 @@
-
 import cv2
 import numpy as np
 from ultralytics import YOLO
@@ -8,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog
 import queue
+from collections import deque # Added for a standard structure, though not strictly required here
 
 # Load YOLOv8 segmentation model
 model = YOLO('yolov8n-seg.pt')
@@ -22,9 +22,13 @@ highlight_color = [0, 255, 0]  # Initial green color
 
 
 video_sources = [0]  # Start with camera 0 by default
-caps = []  # List to hold all cv2.VideoCapture objects
 STANDARD_HEIGHT = 480 # Target height for all videos
 command_queue = queue.Queue()
+
+# --- NEW: Threading Globals ---
+video_readers = [] # List to hold VideoReader objects
+# NOTE: The global 'caps' list is no longer used for the main loop, but will be 
+# temporarily updated by reload_captures if we need to fall back to the old style.
 
 # Editing mode globals
 edit_mode = False
@@ -40,23 +44,147 @@ edited_masks_dict = {}
 # Store original masks for reset: {track_id: {'mask': mask, 'center': (x, y)}}
 original_masks_dict = {}
 
-'''def release_and_open_camera(new_index):
-    global cap, cam_device_index
-    try:
-        if cap is not None:
-            cap.release()
-        cam_device_index = new_index
-        cap = cv2.VideoCapture(cam_device_index)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        print(f"Switched to camera device ID: {cam_device_index}")
-    except Exception as e:
-        print(f"Error switching camera: {e}. Resetting to default (0).")
-        cam_device_index = 0
-        cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        '''
+# --- NEW: VideoReader Class for Parallel Frame Capture ---
+class VideoReader:
+    """A thread-safe class to continuously read frames from a video source."""
+    def __init__(self, source, target_height):
+        self.source = source
+        self.target_height = target_height
+        self.cap = None
+        self.thread = None
+        self.running = False
+        self.frame = None # Holds the latest frame
+        self.read_lock = threading.Lock()
+        self.is_camera = isinstance(source, int)
+        self.is_video_file = not self.is_camera
+        self.is_opened = False
+
+        self._open_capture()
+
+    def _open_capture(self):
+        if self.cap is not None:
+            self.cap.release()
+            self.is_opened = False
+            
+        try:
+            if self.is_camera:
+                self.cap = cv2.VideoCapture(self.source, cv2.CAP_DSHOW)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.target_height)
+            else:
+                self.cap = cv2.VideoCapture(self.source)
+            
+            if self.cap.isOpened():
+                self.is_opened = True
+            else:
+                print(f"Error: Could not open video source: {self.source}")
+
+        except Exception as e:
+            print(f"Failed to open {self.source}: {e}")
+
+    def start(self):
+        """Starts the reader thread."""
+        if self.is_opened:
+            self.running = True
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+
+    def stop(self):
+        """Stops the reader thread and releases the capture."""
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=0.1) # Wait briefly for thread to finish
+        if self.cap is not None:
+            self.cap.release()
+            self.is_opened = False
+
+    def _run(self):
+        """The main loop for the reader thread."""
+        while self.running:
+            ret, frame = self.cap.read()
+            
+            if not ret:
+                if self.is_video_file:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret, frame = self.cap.read()
+                
+                if not ret:
+                    time.sleep(0.01) # Avoid busy loop
+                    continue
+            
+            # Resize frame once in the reader thread (reduces main thread load)
+            try:
+                h, w, _ = frame.shape
+                scale = self.target_height / h
+                new_w = int(w * scale)
+                frame_resized = cv2.resize(frame, (new_w, self.target_height), interpolation=cv2.INTER_AREA)
+            except Exception:
+                time.sleep(0.01) 
+                continue
+
+            with self.read_lock:
+                self.frame = frame_resized
+            
+            if self.is_video_file:
+                # Add a small delay for files to prevent maxing out CPU/disk
+                time.sleep(0.001) 
+            else:
+                # Read as fast as camera allows
+                pass 
+
+
+    def get_latest_frame(self):
+        """Returns the latest frame in a thread-safe manner."""
+        with self.read_lock:
+            # Use 'if self.frame is not None' to avoid error on startup
+            frame_copy = self.frame.copy() if self.frame is not None else None 
+        return frame_copy
+
+# --- MODIFIED: reload_captures now manages VideoReader objects ---
+def reload_captures():
+    """
+    Closes all current VideoReader threads/objects and reloads them 
+    based on the video_sources list. MUST be called from the main thread.
+    """
+    global video_readers, video_sources
+    
+    # 1. Stop and clear all existing readers
+    for reader in video_readers:
+        reader.stop()
+    video_readers.clear()
+
+    valid_sources = []
+    
+    # 2. Create new readers for all sources and start their threads
+    for source in video_sources:
+        reader = VideoReader(source, STANDARD_HEIGHT)
+        if reader.is_opened:
+            reader.start()
+            video_readers.append(reader)
+            valid_sources.append(source)
+        else:
+            print(f"Skipping invalid source: {source}")
+    
+    # Update video_sources to only include valid, opened sources
+    video_sources.clear()
+    video_sources.extend(valid_sources)
+
+    # 3. Fallback if no sources were valid (This part is crucial)
+    if not video_readers:
+        print("No valid video sources. Trying default camera 0...")
+        video_sources.clear()
+        video_sources.append(0)
+        reader = VideoReader(0, STANDARD_HEIGHT)
+        if reader.is_opened:
+            reader.start()
+            video_readers.append(reader)
+            video_sources.clear()
+            video_sources.append(0)
+        else:
+            print("Error: Failed to open default camera 0.")
+            video_sources.clear() # Ensure the list is empty if fallback fails
+            
+# --- Utility Functions (Same as original) ---
 
 def translate_mask(mask, dx, dy):
     """Translate mask by dx, dy pixels."""
@@ -64,60 +192,6 @@ def translate_mask(mask, dx, dy):
     M = np.float32([[1, 0, dx], [0, 1, dy]])
     translated = cv2.warpAffine(mask, M, (cols, rows), borderValue=0)
     return translated
-
-
-# [MODIFIED reload_captures function]
-def reload_captures():
-    """
-    Closes all current video captures and reloads them from the video_sources list.
-    THIS FUNCTION MUST ONLY BE CALLED FROM THE MAIN THREAD.
-    """
-    global caps
-    # Release all existing captures
-    for cap in caps:
-        cap.release()
-    caps.clear()
-
-    # Open all sources
-    for source in video_sources:
-        try:
-            # --- MODIFICATION HERE ---
-            if isinstance(source, int):
-                # Use CAP_DSHOW for cameras, it's more stable on Windows
-                cap = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-            else:
-                # Use default for video files
-                cap = cv2.VideoCapture(source)
-            # --- END MODIFICATION ---
-
-            if not cap.isOpened():
-                print(f"Error: Could not open video source: {source}")
-                continue
-            
-            if isinstance(source, int):
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, STANDARD_HEIGHT)
-            
-            caps.append(cap)
-            print(f"Successfully opened: {source}")
-        except Exception as e:
-            print(f"Failed to open {source}: {e}")
-            
-    
-    if not caps:
-        print("No valid video sources. Trying default camera 0...")
-        video_sources.clear()
-        video_sources.append(0)
-        try:
-            cap = cv2.VideoCapture(0)
-            if cap.isOpened():
-                caps.append(cap)
-                print("Successfully opened default camera 0.")
-            else:
-                print("Error: Failed to open default camera 0.")
-        except Exception as e:
-            print(f"Exception opening default camera 0: {e}")
-# Lock is automatically released here
 
 def mouse_callback(event, x, y, flags, param):
     global selected_track_id, last_seen_time, masks_data, edit_mode
@@ -145,56 +219,44 @@ def mouse_callback(event, x, y, flags, param):
     elif not edit_mode:
         if event == cv2.EVENT_LBUTTONDOWN:
             for idx, (mask, track_id) in enumerate(masks_data):
-                if mask[y, x] > 0:
+                # Ensure y, x are within mask bounds
+                if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1] and mask[y, x] > 0:
                     selected_track_id = track_id
                     last_seen_time = time.time()
-                    print(f"Selected object with track ID: {track_id}")
                     break
 
 def update_highlight_color():
-    global highlight_color
+    global highlight_color, r_slider, g_slider, b_slider, gray_slider
     r = r_slider.get()
     g = g_slider.get()
     b = b_slider.get()
     gray = gray_slider.get()
     highlight_color = [int(b * (gray / 255)), int(g * (gray / 255)), int(r * (gray / 255))]
 
-# [NEW CODE - Replace your old gui_thread function]
 def gui_thread():
-    global edit_mode, selected_track_id, brush_size
+    global edit_mode, selected_track_id, brush_size, r_slider, g_slider, b_slider, gray_slider
 
     root = tk.Tk()
     root.title("Object Tracker Controls")
     root.geometry("400x700")
 
-    # --- GUI-side functions that PUT COMMANDS into the queue ---
-    
-    def add_video_file():
-        filepath = filedialog.askopenfilename(
-            title="Select Video File",
-            filetypes=(("MP4 files", "*.mp4"), ("AVI files", "*.avi"), ("All files", "*.*"))
-        )
-        if filepath:
-            print(f"GUI: Queuing command to add video: {filepath}")
-            command_queue.put(('add_video', filepath)) # Send command
-
-    def switch_to_cam(idx):
-        print(f"GUI: Queuing command to switch to cam {idx}")
-        command_queue.put(('set_cam', idx)) # Send command
-
-    def reset_to_laptop_cam():
-        print("GUI: Queuing command to reset to laptop cam.")
-        command_queue.put(('set_cam', 0)) # Send command
-        
-    def clear_all_videos():
-        print("GUI: Queuing command to clear all sources.")
-        command_queue.put(('clear_all', None)) # Send command
+    # Functions to queue commands
+    def add_video_file(): command_queue.put(('add_video', filedialog.askopenfilename(title="Select Video File", filetypes=(("MP4 files", "*.mp4"), ("AVI files", "*.avi"), ("All files", "*.*")))))
+    def switch_to_cam(idx): command_queue.put(('set_cam', idx))
+    def reset_to_laptop_cam(): command_queue.put(('set_cam', 0))
+    def clear_all_videos(): command_queue.put(('clear_all', None))
+    def reset_track_command(): command_queue.put(('reset_track', None))
+    def clear_mask_edits_command(): command_queue.put(('clear_edits', None))
+    def toggle_edit_mode_command(): command_queue.put(('toggle_edit', None))
+    def adjust_brush(delta):
+        global brush_size
+        brush_size = max(1, min(50, brush_size + delta))
 
     # Buttons for actions
-    ttk.Button(root, text="Quit", command=lambda: command_queue.put(('quit', None))).pack(pady=5) # Send quit command
-    ttk.Button(root, text="Reset Track", command=lambda: reset_track()).pack(pady=5)
-    ttk.Button(root, text="Clear Mask Edits", command=lambda: clear_mask_edits()).pack(pady=5)
-    ttk.Button(root, text="Pause/Resume for Mask Editing", command=lambda: toggle_edit_mode()).pack(pady=5)
+    ttk.Button(root, text="Quit", command=lambda: command_queue.put(('quit', None))).pack(pady=5)
+    ttk.Button(root, text="Reset Track", command=reset_track_command).pack(pady=5)
+    ttk.Button(root, text="Clear Mask Edits", command=clear_mask_edits_command).pack(pady=5)
+    ttk.Button(root, text="Pause/Resume for Mask Editing", command=toggle_edit_mode_command).pack(pady=5)
     
     # File/camera controls
     file_frame = ttk.LabelFrame(root, text="Video Sources")
@@ -216,11 +278,9 @@ def gui_thread():
     ttk.Button(brush_frame, text="-", command=lambda: adjust_brush(-1)).grid(row=0, column=1, padx=5)
 
     # Sliders for color
-    global r_slider, g_slider, b_slider, gray_slider
     color_frame = ttk.LabelFrame(root, text="Color Controls")
     color_frame.pack(pady=10)
-
-    # ... [Your slider code remains exactly the same] ...
+    # ... (Slider creation code remains the same) ...
     ttk.Label(color_frame, text="R").grid(row=0, column=0)
     r_slider = tk.Scale(color_frame, from_=0, to=255, orient=tk.HORIZONTAL, command=lambda v: update_highlight_color())
     r_slider.set(0)
@@ -256,31 +316,24 @@ def reset_track():
 def clear_mask_edits():
     global selected_track_id
     if selected_track_id in edited_masks_dict:
-        # Restore to original mask if available
         if selected_track_id in original_masks_dict:
             edited_masks_dict[selected_track_id] = original_masks_dict[selected_track_id].copy()
         else:
             del edited_masks_dict[selected_track_id]
         print(f"Cleared mask edits for track ID {selected_track_id}, restored to original")
 
-'''def reset_to_laptop_cam():
-    print("Resetting to laptop webcam (device 0).")
-    release_and_open_camera(0)'''
-
 def toggle_edit_mode():
-    global edit_mode, selected_track_id, paused_frame
+    global edit_mode, selected_track_id
     if selected_track_id is not None:
         edit_mode = not edit_mode
         if not edit_mode:
             exit_edit_mode()
 
 def exit_edit_mode():
-    global edit_mode, paused_frame, edited_mask, selected_track_id
-    # Exit edit mode and save changes with original center from bounding box
+    global edit_mode, paused_frame, edited_mask, selected_track_id, results
     edit_mode = False
     if edited_mask is not None and selected_track_id is not None:
         new_mask = (edited_mask / 255).astype(np.uint8)
-        # Get original center from bounding box at edit time
         original_center = None
         if 'results' in globals() and results[0].boxes is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -295,15 +348,11 @@ def exit_edit_mode():
     paused_frame = None
     cv2.setMouseCallback('Object Tracker', mouse_callback)
 
-'''def switch_camera(idx):
-    print(f"Switching to camera device ID {idx}")
-    release_and_open_camera(idx)'''
-
 def adjust_brush(delta):
     global brush_size
     brush_size = max(1, min(50, brush_size + delta))
 
-# [NEW CODE - Replace the start of your main loop]
+# --- Main Execution ---
 
 # Start GUI in a separate thread
 threading.Thread(target=gui_thread, daemon=True).start()
@@ -311,161 +360,118 @@ threading.Thread(target=gui_thread, daemon=True).start()
 cv2.namedWindow('Object Tracker')
 cv2.setMouseCallback('Object Tracker', mouse_callback)
 
-# --- Initial load of captures ---
+# --- Initial load of captures, now using VideoReader threads ---
 reload_captures() 
 print(f"Starting with video sources: {video_sources}")
 
-# [MODIFIED Main Loop]
-
-# ... [Your code for starting the GUI thread and cv2.namedWindow] ...
-# ... [This code is all the same] ...
-
-# Initial load of captures
-reload_captures() 
-print(f"Starting with video sources: {video_sources}")
-
-# --- Main Application Loop ---
-# --- Main Application Loop ---
+# --- Main Application Loop (Consumer) ---
 while True:
     
-    # --- 1. Check for commands from the GUI thread (This part was perfect) ---
+    # --- 1. Process commands from the GUI thread ---
     try:
         command, data = command_queue.get(block=False)
         
         if command == 'add_video':
-            print(f"MAIN: Received command to add video: {data}")
             if len(video_sources) == 1 and video_sources[0] == 0:
-                video_sources.clear() # Remove default cam if adding a file
+                video_sources.clear()
             video_sources.append(data)
-            reload_captures() # Called safely from main thread
-
+            reload_captures()
         elif command == 'set_cam':
-            print(f"MAIN: Received command to set camera: {data}")
             video_sources.clear()
             video_sources.append(data)
-            reload_captures() # Called safely from main thread
-
+            reload_captures()
         elif command == 'clear_all':
-            print("MAIN: Received command to clear all sources.")
             video_sources.clear()
-            video_sources.append(0) # Default back to cam 0
-            reload_captures() # Called safely from main thread
-
+            video_sources.append(0)
+            reload_captures()
         elif command == 'quit':
-            print("MAIN: Received quit command. Exiting.")
-            break # Exit the main loop
+            break
+        elif command == 'reset_track':
+            reset_track()
+        elif command == 'clear_edits':
+            clear_mask_edits()
+        elif command == 'toggle_edit':
+            toggle_edit_mode()
 
     except queue.Empty:
-        pass # No commands, just continue
+        pass
     
     
-    # [FIX 2: Initialize 'overlay' to None so it always exists]
     overlay = None
     
-    # --- 2. Your existing 'edit_mode' or 'tracking' logic ---
+    # --- 2. Tracking/Edit Mode Logic ---
     if not edit_mode:
-        current_caps = caps 
-        current_sources = video_sources
+        frames = []
+        
+        # 2a. Retrieve latest frame from ALL reader threads
+        for reader in video_readers:
+            frame = reader.get_latest_frame()
+            if frame is not None:
+                frames.append(frame)
 
-        if not current_caps:
-            print("No video captures are open. Waiting...")
-            time.sleep(0.1) # Sleep a bit
-            # [FIX 1: Changed 'continue' to 'pass' to allow waitKey to run]
-            pass
-
-        else: # We have caps, so try to read
-            frames = []
-            all_frames_read = True
-            
-            # 1. Read one frame from each source
-            for i, cap in enumerate(current_caps):
-                ret, frame = cap.read()
-                if not ret:
-                    if not isinstance(current_sources[i], int):
-                        print(f"Video file {current_sources[i]} ended. Looping.")
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        ret, frame = cap.read()
-                    
-                    if not ret:
-                        all_frames_read = False
-                        break 
-                
-                # 2. Resize all frames
-                if ret: 
-                    try:
-                        h, w, _ = frame.shape
-                        scale = STANDARD_HEIGHT / h
-                        new_w = int(w * scale)
-                        frame_resized = cv2.resize(frame, (new_w, STANDARD_HEIGHT), interpolation=cv2.INTER_AREA)
-                        frames.append(frame_resized)
-                    except Exception as e:
-                        print(f"Error resizing frame from {current_sources[i]}: {e}")
-                        all_frames_read = False
-                        break
-            
-            if not all_frames_read or not frames:
-                # [FIX 1: Changed 'continue' to 'pass' to allow waitKey to run]
+        if not frames:
+            time.sleep(0.01) 
+            pass # Use pass so waitKey runs
+        else:
+            try:
+                # 2b. Stack the frames (Main Thread, CPU task)
+                combined_frame = np.hstack(frames)
+            except ValueError as e:
+                print(f"Error stacking frames: {e}")
                 pass
-            
-            else: # We have frames, so try to stack
-                try:
-                    combined_frame = np.hstack(frames)
-                except ValueError as e:
-                    print(f"Error stacking frames: {e}")
-                    # [FIX 1: Changed 'continue' to 'pass' to allow waitKey to run]
-                    pass
-                else:
-                    # --- 4. SUCCESS! Run your EXISTING logic on the combined frame ---
-                    results = model.track(combined_frame, persist=True, tracker="bytetrack.yaml")
-                    
-                    overlay = combined_frame.copy() # 'overlay' is now defined
-                    masks_data = []
-
-                    if results[0].masks is not None:
-                        masks = results[0].masks.data.cpu().numpy()
-                        track_ids = results[0].boxes.id.cpu().numpy() if results[0].boxes.id is not None else np.arange(len(masks))
-                        boxes = results[0].boxes.xyxy.cpu().numpy() if results[0].boxes is not None else None
-
-                        for i, mask in enumerate(masks):
-                            track_id = int(track_ids[i]) if len(track_ids) > i else i
-                            mask_resized = cv2.resize(mask, (combined_frame.shape[1], combined_frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-                            mask_binary = (mask_resized > 0.5).astype(np.uint8)
-
-                            current_center = None
-                            if boxes is not None and i < len(boxes):
-                                x1, y1, x2, y2 = boxes[i]
-                                current_center = ((x1 + x2) / 2, (y1 + y2) / 2)
-
-                            if track_id in edited_masks_dict and current_center is not None:
-                                original_center = edited_masks_dict[track_id]['center']
-                                dx = current_center[0] - original_center[0]
-                                dy = current_center[1] - original_center[1]
-                                mask_binary = translate_mask(edited_masks_dict[track_id]['mask'], dx, dy)
-
-                            if selected_track_id is None or track_id == selected_track_id:
-                                if selected_track_id is None:
-                                    color = np.random.randint(0,255,3).tolist()
-                                else:
-                                    color = highlight_color
-                                    last_seen_time = time.time()
-
-                                
+            else:
+                # 2c. YOLO Inference (Main Thread, CPU/GPU task)
+                results = model.track(combined_frame, persist=True, tracker="bytetrack.yaml")
                 
-                                # --- 1. Draw the transparent color fill ---
-                                # We can re-enable this now that the 'continue' bug is fixed
-                                colored_mask = np.zeros_like(combined_frame)
-                                colored_mask[mask_binary == 1] = color
-                                overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.5, 0)
-                                
-                                # --- 2. Draw the outline with the *same color* ---
-                                contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                # We use 'color' here instead of hard-coded red
-                                cv2.drawContours(overlay, contours, -1, color, 2)
+                overlay = combined_frame.copy() 
+                masks_data = []
 
-                            masks_data.append((mask_binary, track_id))
+                if results[0].masks is not None:
+                    masks = results[0].masks.data.cpu().numpy()
+                    track_ids = results[0].boxes.id.cpu().numpy() if results[0].boxes.id is not None else np.arange(len(masks))
+                    boxes = results[0].boxes.xyxy.cpu().numpy() if results[0].boxes is not None else None
 
+                    for i, mask in enumerate(masks):
+                        track_id = int(track_ids[i]) if len(track_ids) > i else i
+                        
+                        # >>> FIX FOR IndexError: RESIZE MASK TO MATCH combined_frame <<<
+                        # combined_frame.shape[1] is width, combined_frame.shape[0] is height
+                        mask_resized = cv2.resize(mask, 
+                                                  (combined_frame.shape[1], combined_frame.shape[0]), 
+                                                  interpolation=cv2.INTER_NEAREST)
+                        mask_binary = (mask_resized > 0.5).astype(np.uint8)
+                        
+                        current_center = None
+                        if boxes is not None and i < len(boxes):
+                            x1, y1, x2, y2 = boxes[i]
+                            current_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+
+                        # Apply user-edited mask translation
+                        if track_id in edited_masks_dict and current_center is not None:
+                            original_center = edited_masks_dict[track_id]['center']
+                            dx = current_center[0] - original_center[0]
+                            dy = current_center[1] - original_center[1]
+                            # Use the stored (already resized) mask and translate it
+                            mask_binary = translate_mask(edited_masks_dict[track_id]['mask'], dx, dy)
+                            
+                        # Highlighting logic
+                        if selected_track_id is None or track_id == selected_track_id:
+                            color = highlight_color if track_id == selected_track_id else np.random.randint(0,255,3).tolist()
+                            if track_id == selected_track_id: last_seen_time = time.time()
+                            
+                            # --- 1. Draw the transparent color fill ---
+                            colored_mask = np.zeros_like(combined_frame)
+                            colored_mask[mask_binary == 1] = color # This now works because mask_binary size matches
+                            overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.5, 0)
+                            
+                            # --- 2. Draw the outline ---
+                            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            cv2.drawContours(overlay, contours, -1, color, 2)
+
+                        masks_data.append((mask_binary, track_id))
+
+                    # Timeout check
                     if selected_track_id is not None and last_seen_time and (time.time() - last_seen_time) > RESET_TIMEOUT:
-                        print(f"Selected object lost for {RESET_TIMEOUT}s. Resetting to multi-object mode.")
                         selected_track_id = None
                         last_seen_time = None
 
@@ -474,18 +480,15 @@ while True:
                     cv2.putText(overlay, instruction_text, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
                     cv2.putText(overlay, cam_text, (10,60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
+
     else:
-        # --- Your edit_mode logic (This was fine) ---
+        # --- Edit Mode Logic (Remains identical) ---
         if paused_frame is None:
-            print("Entering edit mode...")
-            # We need to use the last good 'combined_frame' to pause
-            # Let's check if 'combined_frame' exists from the last loop
             if 'combined_frame' in locals():
                 paused_frame = combined_frame.copy()
             else:
-                print("No frame to pause. Exiting edit mode.")
                 edit_mode = False
-                continue # Use continue here, we'll hit waitKey at the end
+                continue
             
             current_mask_index = None
             for idx, (mask, track_id) in enumerate(masks_data):
@@ -494,7 +497,6 @@ while True:
                     break
             
             if current_mask_index is None:
-                print(f"No mask found for selected track id: {selected_track_id}")
                 edit_mode = False
                 paused_frame = None
                 continue
@@ -515,7 +517,7 @@ while True:
         # Draw mask overlay
         colored_mask = np.zeros_like(paused_frame)
         colored_mask[edited_mask == 255] = np.array(highlight_color, dtype=np.uint8)
-        overlay = cv2.addWeighted(paused_frame, 1, colored_mask, 0.5, 0) # 'overlay' is now defined
+        overlay = cv2.addWeighted(paused_frame, 1, colored_mask, 0.5, 0)
 
         cv2.putText(overlay, "Edit Mode: LMB paint, RMB erase, +/- brush size, 'e' exit edit", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
@@ -524,20 +526,16 @@ while True:
 
     
     # --- 3. Universal Display and Key Handler ---
-    
-    # [FIX 2: Only show the window if 'overlay' was successfully created]
     if overlay is not None:
         cv2.imshow("Object Tracker", overlay)
     
-    # [FIX 1: This waitKey is no longer skipped, so the window will not freeze]
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
-        break # This will also work
+        break
     elif key == ord('r'):
         reset_track()
     elif key == ord('c'):
         clear_mask_edits()
-    # [I've removed 'b' and '0-9' as they are now in your GUI]
     elif key == ord('e'):
         toggle_edit_mode()
         if not edit_mode:
@@ -547,7 +545,7 @@ while True:
     elif key == ord('-') or key == ord('_'):
         adjust_brush(-1)
 
-# --- 4. Cleanup ---
-for cap in caps:
-    cap.release()
+# --- 4. Cleanup (Updated to stop threads) ---
+for reader in video_readers:
+    reader.stop()
 cv2.destroyAllWindows()
