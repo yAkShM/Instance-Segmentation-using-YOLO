@@ -7,8 +7,34 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter import filedialog
 import queue
+import torchreid
+from scipy.spatial import distance
+import torch
+from PIL import Image
+
 
 model = YOLO('yolov8n-seg.pt')
+print("Loading Person Re-ID model...")
+
+
+reid_model = torchreid.models.build_model(
+    name="osnet_x1_0",  
+    num_classes = 1501,
+    pretrained=True    
+)
+
+reid_model = reid_model.cuda()
+reid_model.eval()
+
+reid_transform,_ = torchreid.data.transforms.build_transforms(
+    height=256,
+    width=128,
+    is_test=True  # Use test-mode transforms
+)
+print("Re-ID model loaded successfully.")
+
+target_fingerprints = {}
+highlight_color = [0, 255, 0]
 
 selected_track_ids = set() 
 active_edit_track_id = None 
@@ -16,7 +42,10 @@ active_edit_track_id = None
 RESET_TIMEOUT = 5 
 masks_data = []
 
-highlight_color = [0, 255, 0] 
+
+reid_targets = {}  
+reid_threshold = 0.25
+current_matches = {}  
 
 
 video_sources = [0] 
@@ -32,6 +61,9 @@ edited_mask = None
 paused_frame = None
 current_mask_index = None
 
+boxes = None
+combined_frame = None
+
 edited_masks_dict = {}
 original_masks_dict = {}
 
@@ -45,6 +77,26 @@ def translate_mask(mask, dx, dy):
     translated = cv2.warpAffine(mask, M, (cols, rows), borderValue=0)
     return translated
 
+
+def get_feature_vector(crop):
+    """
+    Takes a single image crop (NumPy array) of a person
+    and returns its 512-dimension feature vector.
+    """
+
+    img_pil = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(img_pil)
+    img_tensor = reid_transform(img_pil)
+    
+    # 2. Add a "batch" dimension and send to the GPU
+    img_tensor = img_tensor.unsqueeze(0).cuda()
+
+    # 3. Get the fingerprint!
+    with torch.no_grad(): # Disable gradient calculations
+        features = reid_model(img_tensor)
+    
+    # 4. Return the fingerprint (as a simple NumPy array)
+    return features.cpu().numpy()[0]
 
 def reload_captures():
     global caps
@@ -87,11 +139,15 @@ def reload_captures():
         except Exception as e:
             print(f"Exception opening default camera 0: {e}")
 
+
+
 def mouse_callback(event, x, y, flags, param):
-    global selected_track_ids, masks_data, edit_mode
-    global drawing, erasing, edited_mask, current_mask_index
+    global masks_data, edit_mode, drawing, erasing
+    global edited_mask, current_mask_index, active_edit_track_id
+    global boxes, combined_frame, reid_targets, current_matches
 
     if edit_mode and edited_mask is not None:
+        # [ ... Brush logic remains exactly the same ... ]
         if event == cv2.EVENT_LBUTTONDOWN:
             drawing = True
             erasing = False
@@ -112,23 +168,47 @@ def mouse_callback(event, x, y, flags, param):
 
     elif not edit_mode:
         if event == cv2.EVENT_LBUTTONDOWN:
-            for idx, (mask, track_id) in enumerate(masks_data):
-                if mask[y, x] > 0:
-                    if track_id in selected_track_ids:
-                        selected_track_ids.remove(track_id)
-                        print(f"Deselected object with track ID: {track_id}")
-                    else:
-                        selected_track_ids.add(track_id)
-                        print(f"Selected object with track ID: {track_id}")
-                    break 
+            if combined_frame is None or boxes is None or not masks_data:
+                print("Click Error: Data not ready.")
+                return
 
-def update_highlight_color():
-    global highlight_color
-    r = r_slider.get()
-    g = g_slider.get()
-    b = b_slider.get()
-    gray = gray_slider.get()
-    highlight_color = [int(b * (gray / 255)), int(g * (gray / 255)), int(r * (gray / 255))]
+            print(f"Click at ({x},{y}).")
+
+            for i, (mask, track_id) in enumerate(masks_data):
+                # Check if click is within mask bounds
+                if 0 <= y < mask.shape[0] and 0 <= x < mask.shape[1]:
+                    if mask[y, x] > 0:
+                        # Found the clicked person!
+                        if boxes is not None and i < len(boxes):
+                            x1, y1, x2, y2 = map(int, boxes[i])
+                            cropped_person = combined_frame[max(0, y1):min(combined_frame.shape[0], y2),
+                                                            max(0, x1):min(combined_frame.shape[1], x2)]
+                            
+                            if cropped_person.size > 0:
+                                # 1. Get fingerprint of person we just clicked
+                                click_fp = get_feature_vector(cropped_person)
+                                
+                                # 2. Check if this person is ALREADY in our targets
+                                match_found_id = None
+                                for t_id, t_data in reid_targets.items():
+                                    dist = distance.cosine(t_data['fp'], click_fp)
+                                    if dist < reid_threshold:
+                                        match_found_id = t_id
+                                        break
+                                
+                                # 3. Toggle Logic
+                                if match_found_id is not None:
+                                    # We already track them -> REMOVE (Deselect)
+                                    del reid_targets[match_found_id]
+                                    print(f"Removed target {match_found_id} (Deselected).")
+                                else:
+                                    # New person -> ADD (Select) with a random unique color
+                                    new_color = np.random.randint(50, 255, 3).tolist()
+                                    reid_targets[track_id] = {'fp': click_fp, 'color': new_color}
+                                    print(f"Added new target {track_id} with color {new_color}.")
+                            else:
+                                print("Error: Crop empty.")
+                        break
 
 def gui_thread():
     global edit_mode, brush_size 
@@ -180,44 +260,31 @@ def gui_thread():
     ttk.Button(brush_frame, text="+", command=lambda: adjust_brush(1)).grid(row=0, column=0, padx=5)
     ttk.Button(brush_frame, text="-", command=lambda: adjust_brush(-1)).grid(row=0, column=1, padx=5)
 
-    global r_slider, g_slider, b_slider, gray_slider
-    color_frame = ttk.LabelFrame(root, text="Color Controls")
-    color_frame.pack(pady=10)
-
-    ttk.Label(color_frame, text="R").grid(row=0, column=0)
-    r_slider = tk.Scale(color_frame, from_=0, to=255, orient=tk.HORIZONTAL, command=lambda v: update_highlight_color())
-    r_slider.set(0)
-    r_slider.grid(row=0, column=1)
-
-    ttk.Label(color_frame, text="G").grid(row=1, column=0)
-    g_slider = tk.Scale(color_frame, from_=0, to=255, orient=tk.HORIZONTAL, command=lambda v: update_highlight_color())
-    g_slider.set(255)
-    g_slider.grid(row=1, column=1)
-
-    ttk.Label(color_frame, text="B").grid(row=2, column=0)
-    b_slider = tk.Scale(color_frame, from_=0, to=255, orient=tk.HORIZONTAL, command=lambda v: update_highlight_color())
-    b_slider.set(0)
-    b_slider.grid(row=2, column=1)
-
-    ttk.Label(color_frame, text="Gray").grid(row=3, column=0)
-    gray_slider = tk.Scale(color_frame, from_=0, to=255, orient=tk.HORIZONTAL, command=lambda v: update_highlight_color())
-    gray_slider.set(255)
-    gray_slider.grid(row=3, column=1)
+    
 
     root.mainloop()
 
 
+
 def reset_track():
     global selected_track_ids, edit_mode, paused_frame, track_history
-    selected_track_ids.clear() 
+    # --- ADD THESE GLOBALS ---
+    
+    global reid_targets, current_matches
+
     
     track_history.clear()
+    reid_targets.clear()
+    current_matches.clear()
+    
+    reid_target_track_id = None
+    reid_target_fingerprint = None
 
     if edit_mode:
         edit_mode = False
         paused_frame = None
         cv2.setMouseCallback('Object Tracker', mouse_callback)
-    print("Selection cleared.")
+    print("Cleared.")
 
 def clear_mask_edits():
     global selected_track_ids, edit_mode, paused_frame 
@@ -263,7 +330,7 @@ def exit_edit_mode():
     if edited_mask is not None and active_edit_track_id is not None:
         new_mask = (edited_mask / 255).astype(np.uint8)
         original_center = None
-        if 'results' in globals() and results[0].boxes is not None:
+        if boxes is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
             track_ids = results[0].boxes.id.cpu().numpy() if results[0].boxes.id is not None else np.arange(len(boxes))
             for i, tid in enumerate(track_ids):
@@ -325,7 +392,7 @@ while True:
         elif command == 'quit':
             print("MAIN: Received quit command. Exiting.")
             break 
-
+            
     except queue.Empty:
         pass 
     
@@ -374,85 +441,193 @@ while True:
             
             else: 
                 try:
+                    
                     combined_frame = np.hstack(frames)
                 except ValueError as e:
                     print(f"Error stacking frames: {e}")
                     pass
                 else:
-                    results = model.track(combined_frame, persist=True, tracker="bytetrack.yaml")
+                    results = model.track(combined_frame, persist=True, tracker="bytetrack.yaml", verbose=False)
                     
                     overlay = combined_frame.copy() 
-                    masks_data = []
+                    #masks_data = [] # <--- DO NOT RESET IT HERE
                     
+                    new_masks_data = [] # <--- Create a *new, temporary* list
                     current_track_ids = set()
 
-                    if results[0].masks is not None:
-                        masks = results[0].masks.data.cpu().numpy()
-                        track_ids = results[0].boxes.id.cpu().numpy() if results[0].boxes.id is not None else np.arange(len(masks))
-                        boxes = results[0].boxes.xyxy.cpu().numpy() if results[0].boxes is not None else None
 
+                if results[0].masks is not None:
+                    masks = results[0].masks.data.cpu().numpy()
+                    
+                    # --- Calculate boxes (Keep this fix!) ---
+                    if results[0].boxes is not None and results[0].boxes.id is not None:
+                        boxes = results[0].boxes.xyxy.cpu().numpy()
+                        track_ids = results[0].boxes.id.cpu().numpy()
+                    else:
+                        boxes = None
+                        track_ids = np.arange(len(masks))
+                    
+                    # --- 1. MULTI-TARGET RE-ID MATCHING ---
+                    current_matches = {} # Reset current frame matches
+                    
+                    # First, assume any "Original" target ID that is still on screen is a match
+                    for i, t_id in enumerate(track_ids):
+                        tid_int = int(t_id)
+                        if tid_int in reid_targets:
+                            current_matches[tid_int] = reid_targets[tid_int]['color']
+
+                    # Now, check everyone else using Re-ID
+                    if reid_targets:
+                        # Collect unknown people (those not already matched by ID)
+                        crops_to_process = []
+                        track_ids_to_process = []
+                        
                         for i, mask in enumerate(masks):
                             track_id = int(track_ids[i]) if len(track_ids) > i else i
                             
-                            current_track_ids.add(track_id)
+                            if track_id not in current_matches: # Only check if not already known
+                                if boxes is not None and i < len(boxes):
+                                    x1, y1, x2, y2 = map(int, boxes[i])
 
-                            mask_resized = cv2.resize(mask, (combined_frame.shape[1], combined_frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-                            mask_binary = (mask_resized > 0.5).astype(np.uint8)
+                                    # Calculate height
+                                    person_height = y2 - y1
+                                    
+                                    # [FIX 1] Ignore people who are too small (e.g., < 100 pixels tall)
+                                    if person_height < 100:
+                                        continue
 
-                            current_center = None
-                            if boxes is not None and i < len(boxes):
-                                x1, y1, x2, y2 = boxes[i]
-                                current_center = ((x1 + x2) / 2, (y1 + y2) / 2)
-                                
-                                if track_id not in track_history:
-                                    track_history[track_id] = []
-                                track_history[track_id].append((int(current_center[0]), int(current_center[1])))
-                                
-                                if len(track_history[track_id]) > TRAIL_LENGTH:
-                                    track_history[track_id].pop(0) 
+                                    # [FIX 3] Tighter Crop
+                                    # Crop 5% from edges to remove background noise
+                                    h, w = y2 - y1, x2 - x1
+                                    crop_y1 = int(y1 + h * 0.05)
+                                    crop_y2 = int(y2 - h * 0.05)
+                                    crop_x1 = int(x1 + w * 0.05)
+                                    crop_x2 = int(x2 - w * 0.05)
 
+                                    
+                                    cropped_person = combined_frame[max(0, y1):min(combined_frame.shape[0], y2),
+                                                                   max(0, x1):min(combined_frame.shape[1], x2)]
+                                    if cropped_person.size > 0:
+                                        crops_to_process.append(cropped_person)
+                                        track_ids_to_process.append(track_id)
 
-                            if track_id in edited_masks_dict and current_center is not None:
-                                original_center = edited_masks_dict[track_id]['center']
-                                dx = current_center[0] - original_center[0]
-                                dy = current_center[1] - original_center[1]
-                                mask_binary = translate_mask(edited_masks_dict[track_id]['mask'], dx, dy)
-
-                            color_to_draw = None
-                            if not selected_track_ids:
-                                color_to_draw = np.random.randint(0, 255, 3).tolist()
-                            elif track_id in selected_track_ids:
-                                color_to_draw = highlight_color
+                        # Batch Inference
+                        if crops_to_process:
+                            batch_tensors = []
+                            for crop in crops_to_process:
+                                img_pil = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                                img_pil = Image.fromarray(img_pil)
+                                batch_tensors.append(reid_transform(img_pil))
                             
-                            if color_to_draw is not None:
-                                colored_mask = np.zeros_like(combined_frame)
-                                colored_mask[mask_binary == 1] = color_to_draw
-                                overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.5, 0)
+                            batch_input = torch.stack(batch_tensors).cuda()
+                            with torch.no_grad():
+                                batch_features = reid_model(batch_input) 
+                            batch_fingerprints = batch_features.cpu().numpy()
+
+                            
+                            # [REPLACE THE OLD 'for j' LOOP WITH THIS]
+                            
+                            # Compare each person on screen against ALL targets
+                            for j, current_fp in enumerate(batch_fingerprints):
+                                current_track_id = track_ids_to_process[j]
                                 
-                                contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                cv2.drawContours(overlay, contours, -1, color_to_draw, 2)
+                                # Start with a "None" match
+                                best_dist = 1.0 
+                                best_color = None
+                                
+                               
+                                if current_track_id in track_history:
+                                    current_threshold = 0.35  # Lenient for existing tracks
+                                else:
+                                    current_threshold = 0.20  # Strict for new tracks
+                                
+                                # Check against all targets
+                                for t_id, t_data in reid_targets.items():
+                                    dist = distance.cosine(t_data['fp'], current_fp)
+                                    
+                                    # Uncomment for debugging:
+                                    # print(f"DEBUG: ID {current_track_id} vs Target {t_id} = {dist:.4f} (Thresh: {current_threshold})")
 
-                            masks_data.append((mask_binary, track_id)) 
+                                    # Check if it matches our dynamic threshold AND is the best match so far
+                                    if dist < current_threshold and dist < best_dist:
+                                        best_dist = dist
+                                        best_color = t_data['color']
+                                
+                                # If we found a valid match after checking all targets
+                                if best_color is not None:
+                                    current_matches[current_track_id] = best_color
 
+                    # --- 2. DRAWING LOOP ---
+                    new_masks_data = [] # Temp list for click fix
+
+                    for i, mask in enumerate(masks):
+                        track_id = int(track_ids[i]) if len(track_ids) > i else i
+                        
+                        current_track_ids.add(track_id)
+
+                        mask_resized = cv2.resize(mask, (combined_frame.shape[1], combined_frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+                        mask_binary = (mask_resized > 0.5).astype(np.uint8)
+
+                        current_center = None
+                        if boxes is not None and i < len(boxes):
+                            x1, y1, x2, y2 = boxes[i]
+                            current_center = ((x1 + x2) / 2, (y1 + y2) / 2)
+                            
+                            if track_id not in track_history:
+                                track_history[track_id] = []
+                            track_history[track_id].append((int(current_center[0]), int(current_center[1])))
+                            if len(track_history[track_id]) > TRAIL_LENGTH:
+                                track_history[track_id].pop(0) 
+
+                        if track_id in edited_masks_dict and current_center is not None:
+                            original_center = edited_masks_dict[track_id]['center']
+                            dx = current_center[0] - original_center[0]
+                            dy = current_center[1] - original_center[1]
+                            mask_binary = translate_mask(edited_masks_dict[track_id]['mask'], dx, dy)
+
+                        # --- Color Logic ---
+                        color_to_draw = None
+                        
+                        # Is this person in our 'current_matches' list?
+                        if track_id in current_matches:
+                            color_to_draw = current_matches[track_id]
+                        else:
+                            # If they are not a match, DO NOT DRAW THEM.
+                            color_to_draw = None
+                        
+                        if color_to_draw is not None:
+                            colored_mask = np.zeros_like(combined_frame)
+                            colored_mask[mask_binary == 1] = color_to_draw
+                            overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.5, 0)
+                            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                            cv2.drawContours(overlay, contours, -1, color_to_draw, 2)
+
+                        new_masks_data.append((mask_binary, track_id))
                     
+                    # --- Update Global Mask Data (The Flicker Fix) ---
+                    if new_masks_data:
+                        masks_data = new_masks_data
+                    
+                    # --- Cleanup History ---
                     for old_track_id in list(track_history.keys()):
                         if old_track_id not in current_track_ids:
                             del track_history[old_track_id]
 
                     
-
-
-                    instruction_text = "Click to toggle selection. Use GUI for other controls."
-                    cam_text = f"Sources: {len(video_sources)} | Selected: {len(selected_track_ids)}"
-                    cv2.putText(overlay, instruction_text, (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-                    cv2.putText(overlay, cam_text, (10,60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                    
+    # [ ... your 'if not edit_mode:' block ends here ... ]
 
     else:
+        # --- THIS IS THE NEW, CORRECTED "EDIT MODE" BLOCK ---
         if paused_frame is None:
             print("Entering edit mode...")
-            if 'combined_frame' in locals():
+            
+            # --- THE FIX ---
+            # Check the GLOBAL variable, not the 'local' one
+            if combined_frame is not None:
                 paused_frame = combined_frame.copy()
             else:
+            # ---------------
                 print("No frame to pause. Exiting edit mode.")
                 edit_mode = False
                 continue 
@@ -469,6 +644,7 @@ while True:
                 paused_frame = None
                 continue
 
+            # --- This logic below is unchanged, but now it will run ---
             original_mask = masks_data[current_mask_index][0]
             ys, xs = np.where(original_mask > 0)
             if len(xs) > 0 and len(ys) > 0:
@@ -483,6 +659,7 @@ while True:
             edited_mask = cv2.threshold(edited_mask, 127, 255, cv2.THRESH_BINARY)[1]
             cv2.setMouseCallback('Object Tracker', mouse_callback)
         
+        # This part will now work because paused_frame is set
         colored_mask = np.zeros_like(paused_frame)
         colored_mask[edited_mask == 255] = np.array(highlight_color, dtype=np.uint8)
         overlay = cv2.addWeighted(paused_frame, 1, colored_mask, 0.5, 0) 
